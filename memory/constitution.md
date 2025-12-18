@@ -292,4 +292,67 @@ Before Azure deployment, verify:
 - Microsoft Learn documentation: Use `mcp_microsoft_doc_microsoft_docs_search`
 - Azure architecture patterns: Azure Architecture Center
 
-**Version**: 1.0.0 | **Ratified**: 2025-11-18 | **Last Amended**: 2025-11-18
+## Dataverse API app development Principles
+
+## 1. Purpose
+
+1. Provide a reliable pattern for triggering long-running, spec-driven work from Dataverse without blocking the Dataverse transaction pipeline.
+2. Standardize a message contract for passing parameters from Dataverse plug-ins to Azure Functions through Service Bus.
+3. Execute “specs” in Azure Functions, persist outcomes, and notify the initiating user with an in-app toast when complete.
+4. Ensure Service Bus message locks are renewed for the duration of execution (within configured limits).
+
+## 2. Non-negotiable principles
+
+### 2.1 Keep Dataverse plug-ins fast
+- Plug-ins must **only** validate input, assemble a minimal payload, and enqueue work.
+- Plug-ins must avoid long-running operations, external dependencies, and large data movement.
+
+### 2.2 Asynchronous by default
+- Use asynchronous registration for plug-ins that post to Service Bus to protect user experience and overall org performance.
+
+### 2.3 Contract-first integration
+- The **message schema** between Dataverse and Azure Functions is versioned and treated as public API.
+- Backward compatibility is required for at least one minor version.
+
+### 2.4 At-least-once delivery; idempotent processing
+- Service Bus delivery is assumed to be *at least once*.
+- Every spec execution must be idempotent using a deterministic `runId`/`idempotencyKey`.
+
+### 2.5 Observable by design
+- Every hop must include correlation identifiers.
+- Traces and logs must allow reconstructing a single run end-to-end.
+
+### 2.6 Secure-by-default
+- Use least privilege (Dataverse app user, Managed Identity for Functions, scoped RBAC for Service Bus).
+- Never include secrets in Service Bus messages.
+
+## 3. Platform behaviors references (to verify/align implementation)
+- Dataverse “Azure-aware” plug-ins post the execution context to Azure Service Bus and are recommended to stay fast; asynchronous posting involves the service endpoint notification service.  [oai_citation:0‡Microsoft Learn](https://learn.microsoft.com/en-us/power-apps/developer/data-platform/write-custom-azure-aware-plugin)  
+- Service Bus peek-lock duration has a maximum of 5 minutes; longer processing requires lock renewal.  [oai_citation:1‡Microsoft Learn](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-transfers-locks-settlement)  
+- Azure Functions Service Bus trigger renews locks while the function is running, and `maxAutoRenewDuration` in `host.json` controls the maximum renewal window (default 5 minutes).  [oai_citation:2‡Microsoft Learn](https://learn.microsoft.com/en-us/azure/azure-functions/functions-bindings-service-bus-trigger)  
+- Model-driven apps can display notifications as a toast and poll for new notifications.  [oai_citation:3‡Microsoft Learn](https://learn.microsoft.com/en-us/power-apps/developer/model-driven-apps/clientapi/send-in-app-notifications)  
+- The Dataverse Notification table is `appnotification` (includes fields such as title/body and toast behavior options).  [oai_citation:4‡Microsoft Learn](https://learn.microsoft.com/en-us/power-apps/developer/data-platform/reference/entities/appnotification)
+
+## 4. Architecture
+
+### 4.1 High-level flow
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant U as User (Model-driven app)
+  participant D as Dataverse
+  participant P as .NET Plug-in (Sandbox)
+  participant SB as Azure Service Bus
+  participant F as Azure Function (Premium)
+  participant N as Dataverse Notification (appnotification)
+
+  U->>D: Create/Update/Command triggers spec run
+  D->>P: Invoke plug-in step
+  P->>SB: Enqueue SpecRunRequested message
+  SB->>F: ServiceBusTrigger delivers message (PeekLock)
+  F->>F: Execute spec (renew message lock while running)
+  F->>D: Persist results + status
+  F->>N: Create appnotification for initiating user
+  D-->>U: App polls; shows toast + notification center item
+```
